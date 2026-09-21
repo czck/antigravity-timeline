@@ -1,0 +1,29 @@
+{
+  "name": "antigravity-timeline",
+  "version": "1.0.0",
+  "description": "🧭 Codex-style session timeline anchor & mini-map for Antigravity desktop app (会话轮次锚点时间轴)",
+  "main": "src/timeline.js",
+  "scripts": {
+    "install-hook": "node scripts/install.js",
+    "uninstall-hook": "node scripts/uninstall.js",
+    "check": "node --check src/timeline.js"
+  },
+  "keywords": [
+    "antigravity",
+    "timeline",
+    "codex",
+    "electron",
+    "minimap",
+    "chat-navigation"
+  ],
+  "author": "czck",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/czck/antigravity-timeline.git"
+  },
+  "bugs": {
+    "url": "https://github.com/czck/antigravity-timeline/issues"
+  },
+  "homepage": "https://github.com/czck/antigravity-timeline#readme"
+}
