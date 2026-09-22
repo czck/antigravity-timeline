@@ -55,14 +55,16 @@
       return { userText, aiText };
     }
 
-    // 2. Viewport-anchored silent history preloader (never shifts scroll position)
+    // 2. 带有视口锚定锁的静默历史补全（单会话仅执行一次，彻底杜绝轮询引发的滚动突跳）
     function autoPreloadHistory(scrollContainer) {
-      if (isPreloadingHistory) return;
+      if (isPreloadingHistory || historyPreloadedForPath === window.location.pathname) return;
       const btn = Array.from(document.querySelectorAll('button')).find(b => 
-        b.textContent.includes('Load older messages')
+        (b.textContent && b.textContent.includes('Load older messages')) ||
+        (b.getAttribute('aria-label') && b.getAttribute('aria-label').includes('Load older messages'))
       );
       if (!btn) return;
 
+      historyPreloadedForPath = window.location.pathname;
       isPreloadingHistory = true;
       let attempts = 0;
       const maxAttempts = 25;
@@ -493,27 +495,54 @@
           if (!scrollContainer || scrollContainer.__smartAutoScrollGuardActive) return;
           scrollContainer.__smartAutoScrollGuardActive = true;
 
-          let isAutoScrollEnabled = true;
-          const BOTTOM_THRESHOLD = 80;
+          let isAutoScrollEnabled = false;
+          let lastScrollTop = scrollContainer.scrollTop;
 
-          function getDistanceFromBottom() {
-            return scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight;
+          // 1. 拦截并接管 scrollTo (支持对象形式与双参数形式)
+          const origScrollTo = scrollContainer.scrollTo;
+          scrollContainer.scrollTo = function(xOrOptions, y, ...rest) {
+            let targetTop = null;
+            if (typeof xOrOptions === 'object' && xOrOptions !== null) {
+              targetTop = xOrOptions.top;
+            } else if (typeof y === 'number') {
+              targetTop = y;
+            }
+            if (typeof targetTop === 'number') {
+              const maxScroll = this.scrollHeight - this.clientHeight;
+              // 若目标位置为触底（>= maxScroll - 60），且用户正向上阅读历史 -> 拦截自动吸底
+              if (targetTop >= maxScroll - 60 && !isAutoScrollEnabled) {
+                return;
+              }
+            }
+            return origScrollTo.call(this, xOrOptions, y, ...rest);
+          };
+
+          // 2. 拦截并接管 scrollTop setter，屏蔽来自内部逻辑的强制直接触底赋值
+          const desc = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop');
+          if (desc && desc.set) {
+            Object.defineProperty(scrollContainer, 'scrollTop', {
+              get: function() { return desc.get.call(this); },
+              set: function(val) {
+                const maxScroll = this.scrollHeight - this.clientHeight;
+                if (val >= maxScroll - 60 && !isAutoScrollEnabled) {
+                  return;
+                }
+                return desc.set.call(this, val);
+              },
+              configurable: true
+            });
           }
 
-          function checkIfAtBottom() {
-            return getDistanceFromBottom() <= BOTTOM_THRESHOLD;
-          }
-
-          // 1. 监听滚轮事件 (wheel 早于 scroll 触发，毫秒级打断吸底)
+          // 3. 监听滚轮事件 (向上滚瞬间锁定，绝不允许向上滚动被重置为吸底)
           scrollContainer.addEventListener('wheel', (e) => {
             if (e.deltaY < 0) {
               isAutoScrollEnabled = false;
-            } else if (e.deltaY > 0 && checkIfAtBottom()) {
+            } else if (e.deltaY > 0 && (scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight) <= 10) {
               isAutoScrollEnabled = true;
             }
           }, { passive: true });
 
-          // 2. 监听触控板与触摸移动
+          // 4. 监听触控板与触摸移动
           let touchStartY = 0;
           scrollContainer.addEventListener('touchstart', (e) => {
             if (e.touches && e.touches[0]) touchStartY = e.touches[0].clientY;
@@ -524,35 +553,25 @@
               const delta = e.touches[0].clientY - touchStartY;
               if (delta > 5) {
                 isAutoScrollEnabled = false;
-              } else if (delta < -5 && checkIfAtBottom()) {
+              } else if (delta < -5 && (scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight) <= 10) {
                 isAutoScrollEnabled = true;
               }
             }
           }, { passive: true });
 
-          // 3. 监听滚动事件：用户滑回底部时无缝恢复吸底
+          // 5. 监听滚动事件：只要在向上滚动，坚决保持锁定；仅在明确向下滑动到底部时才恢复吸底
           scrollContainer.addEventListener('scroll', () => {
-            if (checkIfAtBottom()) {
-              isAutoScrollEnabled = true;
-            } else if (getDistanceFromBottom() > BOTTOM_THRESHOLD + 40) {
+            const curr = scrollContainer.scrollTop;
+            const dist = scrollContainer.scrollHeight - curr - scrollContainer.clientHeight;
+            if (curr < lastScrollTop - 2) {
               isAutoScrollEnabled = false;
+            } else if (dist <= 5 && curr > lastScrollTop + 2) {
+              isAutoScrollEnabled = true;
             }
+            lastScrollTop = curr;
           }, { passive: true });
 
-          // 4. 拦截并接管 scrollTo：屏蔽流式输出时来自 ResizeObserver 的强制触底调用
-          const origScrollTo = scrollContainer.scrollTo;
-          scrollContainer.scrollTo = function(options, ...rest) {
-            if (typeof options === 'object' && options !== null && typeof options.top === 'number') {
-              const maxScroll = this.scrollHeight - this.clientHeight;
-              // 若目标位置为触底（>= maxScroll - 40），且用户正向上阅读历史 -> 拦截自动吸底
-              if (options.top >= maxScroll - 40 && !isAutoScrollEnabled) {
-                return;
-              }
-            }
-            return origScrollTo.call(this, options, ...rest);
-          };
-
-          // 5. 点击“回到底部”按钮时瞬间恢复吸底
+          // 6. 点击“回到底部”按钮时瞬间恢复吸底
           document.addEventListener('click', (e) => {
             const btn = e.target?.closest?.('button[aria-label*="Bottom"], button[aria-label*="底部"], [data-testid="scroll-to-bottom"]');
             if (btn) {
@@ -571,7 +590,7 @@
       const style = document.createElement('style');
       style.id = 'antigravity-scroll-stabilizer';
       style.textContent = `
-        /* 1. 彻底禁用全容器及子节点滚动锚定，杜绝向上滚动时的锚点偏移抖动 */
+        /* 1. 彻底禁用全容器及子节点滚动锚定与吸附，杜绝向上滚动时的锚点偏移抖动 */
         [data-testid="autoscroll-viewport"],
         [data-testid="autoscroll-viewport"] * {
           overflow-anchor: none !important;
@@ -579,13 +598,15 @@
           scroll-snap-align: none !important;
         }
 
-        /* 2. 保证原生滚动即时响应，消除滚动插值与鼠标滚轮的阻尼冲突 */
+        /* 2. 保证原生即时滚动响应，启用硬件加速独立合成层，杜绝文字重叠残影与闪烁 */
         [data-testid="autoscroll-viewport"] {
           scroll-behavior: auto !important;
           overscroll-behavior-y: contain;
+          transform: translateZ(0);
+          will-change: scroll-position;
         }
 
-        /* 3. 隔离子节点样式重排重绘，保障长对话流畅渲染 */
+        /* 3. 隔离子节点重排重绘，防止尺寸过渡动画引发连环 Reflow */
         .relative.flex.flex-col.gap-y-3 > div {
           contain: style;
         }
@@ -630,15 +651,12 @@
       if (turnsWrapper && scrollContainer) {
         setupSmartAutoScrollGuard(scrollContainer);
         setupScrollStabilizer();
-        autoPreloadHistory(scrollContainer);
         if (!bar || !bar.isConnected || bar.style.left !== '10px') {
           setupTimeline();
         } else {
           const mountedCount = turnsWrapper.querySelectorAll(':scope > .flex.items-start').length;
           if (mountedCount !== recordedTurns.length) {
             syncTurns(turnsWrapper, scrollContainer);
-          }
-        }
       }
     }, 1000);
 
