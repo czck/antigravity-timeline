@@ -480,11 +480,98 @@
       }
     }
 
+    // 8. 智能防强制吸底滚动守护 (Smart Auto-Scroll & Streaming Interruption Guard)
+    function setupSmartAutoScrollGuard(scrollContainer) {
+      if (!scrollContainer || scrollContainer.__smartAutoScrollGuardInstalled) return;
+      scrollContainer.__smartAutoScrollGuardInstalled = true;
+
+      const script = document.createElement('script');
+      script.textContent = `
+        (function() {
+          const turnsWrapper = document.querySelector('.relative.flex.flex-col.gap-y-3');
+          const scrollContainer = turnsWrapper?.closest('.overflow-y-auto');
+          if (!scrollContainer || scrollContainer.__smartAutoScrollGuardActive) return;
+          scrollContainer.__smartAutoScrollGuardActive = true;
+
+          let isAutoScrollEnabled = true;
+          const BOTTOM_THRESHOLD = 80;
+
+          function getDistanceFromBottom() {
+            return scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight;
+          }
+
+          function checkIfAtBottom() {
+            return getDistanceFromBottom() <= BOTTOM_THRESHOLD;
+          }
+
+          // 1. 监听滚轮事件 (wheel 早于 scroll 触发，毫秒级打断吸底)
+          scrollContainer.addEventListener('wheel', (e) => {
+            if (e.deltaY < 0) {
+              isAutoScrollEnabled = false;
+            } else if (e.deltaY > 0 && checkIfAtBottom()) {
+              isAutoScrollEnabled = true;
+            }
+          }, { passive: true });
+
+          // 2. 监听触控板与触摸移动
+          let touchStartY = 0;
+          scrollContainer.addEventListener('touchstart', (e) => {
+            if (e.touches && e.touches[0]) touchStartY = e.touches[0].clientY;
+          }, { passive: true });
+
+          scrollContainer.addEventListener('touchmove', (e) => {
+            if (e.touches && e.touches[0]) {
+              const delta = e.touches[0].clientY - touchStartY;
+              if (delta > 5) {
+                isAutoScrollEnabled = false;
+              } else if (delta < -5 && checkIfAtBottom()) {
+                isAutoScrollEnabled = true;
+              }
+            }
+          }, { passive: true });
+
+          // 3. 监听滚动事件：用户滑回底部时无缝恢复吸底
+          scrollContainer.addEventListener('scroll', () => {
+            if (checkIfAtBottom()) {
+              isAutoScrollEnabled = true;
+            } else if (getDistanceFromBottom() > BOTTOM_THRESHOLD + 40) {
+              isAutoScrollEnabled = false;
+            }
+          }, { passive: true });
+
+          // 4. 拦截并接管 scrollTo：屏蔽流式输出时来自 ResizeObserver 的强制触底调用
+          const origScrollTo = scrollContainer.scrollTo;
+          scrollContainer.scrollTo = function(options, ...rest) {
+            if (typeof options === 'object' && options !== null && typeof options.top === 'number') {
+              const maxScroll = this.scrollHeight - this.clientHeight;
+              // 若目标位置为触底（>= maxScroll - 40），且用户正向上阅读历史 -> 拦截自动吸底
+              if (options.top >= maxScroll - 40 && !isAutoScrollEnabled) {
+                return;
+              }
+            }
+            return origScrollTo.call(this, options, ...rest);
+          };
+
+          // 5. 点击“回到底部”按钮时瞬间恢复吸底
+          document.addEventListener('click', (e) => {
+            const btn = e.target?.closest?.('button[aria-label*="Bottom"], button[aria-label*="底部"], [data-testid="scroll-to-bottom"]');
+            if (btn) {
+              isAutoScrollEnabled = true;
+            }
+          }, true);
+        })();
+      `;
+      (document.head || document.documentElement).appendChild(script);
+      script.remove();
+    }
+
     function setupTimeline() {
       const turnsWrapper = document.querySelector('.relative.flex.flex-col.gap-y-3');
       if (!turnsWrapper) return;
       const scrollContainer = turnsWrapper.closest('.overflow-y-auto');
       if (!scrollContainer) return;
+
+      setupSmartAutoScrollGuard(scrollContainer);
 
       if (turnsWrapper.__timelineObserver) {
         turnsWrapper.__timelineObserver.disconnect();
@@ -512,6 +599,7 @@
       const scrollContainer = turnsWrapper?.closest('.overflow-y-auto');
       const bar = document.getElementById('chat-message-timeline');
       if (turnsWrapper && scrollContainer) {
+        setupSmartAutoScrollGuard(scrollContainer);
         autoPreloadHistory(scrollContainer);
         if (!bar || !bar.isConnected || bar.style.left !== '10px') {
           setupTimeline();
