@@ -657,6 +657,8 @@
           const mountedCount = turnsWrapper.querySelectorAll(':scope > .flex.items-start').length;
           if (mountedCount !== recordedTurns.length) {
             syncTurns(turnsWrapper, scrollContainer);
+          }
+        }
       }
     }, 1000);
 
