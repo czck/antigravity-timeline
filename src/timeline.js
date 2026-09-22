@@ -17,8 +17,6 @@
     let currentPath = '';
     let recordedTurns = []; // [{ key, userText, aiText, el, lastScrollTop }]
     let activeIndex = -1;
-    let isPreloadingHistory = false;
-    let historyPreloadedForPath = '';
 
     // 1. Deep user prompt normalization: thoroughly clean date/timestamp variations and edited tags
     function cleanUserText(raw) {
@@ -55,54 +53,7 @@
       return { userText, aiText };
     }
 
-    // 2. 带有视口锚定锁的静默历史补全（单会话仅执行一次，彻底杜绝轮询引发的滚动突跳）
-    function autoPreloadHistory(scrollContainer) {
-      if (isPreloadingHistory || historyPreloadedForPath === window.location.pathname) return;
-      const btn = Array.from(document.querySelectorAll('button')).find(b => 
-        (b.textContent && b.textContent.includes('Load older messages')) ||
-        (b.getAttribute('aria-label') && b.getAttribute('aria-label').includes('Load older messages'))
-      );
-      if (!btn) return;
-
-      historyPreloadedForPath = window.location.pathname;
-      isPreloadingHistory = true;
-      let attempts = 0;
-      const maxAttempts = 25;
-
-      function step() {
-        const b = Array.from(document.querySelectorAll('button')).find(btnEl => 
-          btnEl.textContent.includes('Load older messages')
-        );
-        if (b && attempts < maxAttempts) {
-          attempts++;
-          const prevHeight = scrollContainer ? scrollContainer.scrollHeight : 0;
-          const prevTop = scrollContainer ? scrollContainer.scrollTop : 0;
-
-          const key = Object.keys(b).find(k => k.startsWith('__reactProps'));
-          if (key && b[key] && typeof b[key].onClick === 'function') {
-            b[key].onClick({ preventDefault: () => {}, stopPropagation: () => {} });
-          } else {
-            b.click();
-          }
-
-          // Viewport scroll compensation: keep currently viewed turn fixed in viewport
-          setTimeout(() => {
-            if (scrollContainer && prevTop > 50) {
-              const delta = scrollContainer.scrollHeight - prevHeight;
-              if (delta > 0) {
-                scrollContainer.scrollTop = prevTop + delta;
-              }
-            }
-            step();
-          }, 200);
-        } else {
-          isPreloadingHistory = false;
-        }
-      }
-      step();
-    }
-
-    // 3. Strict DOM topology order sync: strictly prevents duplicates and turn swapping
+    // 2. Strict DOM topology order sync: strictly prevents duplicates and turn swapping
     function syncTurns(turnsWrapper, scrollContainer) {
       if (!turnsWrapper || !scrollContainer) return;
       const mountedEls = Array.from(turnsWrapper.querySelectorAll(':scope > .flex.items-start'));
@@ -131,7 +82,6 @@
         currentPath = window.location.pathname;
         recordedTurns = [];
         activeIndex = -1;
-        historyPreloadedForPath = '';
       }
 
       if (recordedTurns.length === 0) {
@@ -209,6 +159,7 @@
         if (idx === 0) {
           scrollContainer.scrollTo({ top: 0, behavior: 'smooth' });
         } else if (idx === total - 1) {
+          scrollContainer.dispatchEvent(new CustomEvent('antigravity-unblock-autoscroll'));
           scrollContainer.scrollTo({ top: scrollContainer.scrollHeight, behavior: 'smooth' });
         } else if (turnRecord.lastScrollTop !== undefined && turnRecord.lastScrollTop > 0) {
           scrollContainer.scrollTo({ top: Math.max(0, turnRecord.lastScrollTop - 76), behavior: 'smooth' });
@@ -242,9 +193,13 @@
       const scrollHeight = scrollContainer.scrollHeight;
       const clientHeight = scrollContainer.clientHeight;
 
-      if (scrollTop <= 20) {
+      // Only clamp to 0 or last if that specific turn is actually mounted and visible
+      const firstTurnMounted = recordedTurns[0]?.el && recordedTurns[0].el.isConnected;
+      const lastTurnMounted = recordedTurns[recordedTurns.length - 1]?.el && recordedTurns[recordedTurns.length - 1].el.isConnected;
+
+      if (firstTurnMounted && scrollTop <= 20) {
         targetIdx = 0;
-      } else if (scrollHeight - scrollTop <= clientHeight + 35) {
+      } else if (lastTurnMounted && scrollHeight - scrollTop <= clientHeight + 35) {
         targetIdx = recordedTurns.length - 1;
       } else {
         const cRect = scrollContainer.getBoundingClientRect();
@@ -264,7 +219,14 @@
             }
           }
         }
-        if (targetIdx === -1) targetIdx = recordedTurns.length - 1;
+        if (targetIdx === -1) {
+          for (let i = recordedTurns.length - 1; i >= 0; i--) {
+            if (recordedTurns[i].el && recordedTurns[i].el.isConnected) {
+              targetIdx = i;
+              break;
+            }
+          }
+        }
       }
 
       if (targetIdx !== -1 && targetIdx !== activeIndex) {
@@ -495,54 +457,52 @@
           if (!scrollContainer || scrollContainer.__smartAutoScrollGuardActive) return;
           scrollContainer.__smartAutoScrollGuardActive = true;
 
-          let isAutoScrollEnabled = false;
-          let lastScrollTop = scrollContainer.scrollTop;
+          // 核心控制状态：用户是否已主动向上翻看历史消息（打断自动吸底）
+          let isAutoScrollBlocked = false;
 
-          // 1. 拦截并接管 scrollTo (支持对象形式与双参数形式)
-          const origScrollTo = scrollContainer.scrollTo;
+          // 1. 仅拦截流式输出期间由 DP 触发的 instant 强制吸底（允许用户平滑导航及按钮触底）
+          // 绝不劫持 Element.prototype.scrollTop setter，以保证 Antigravity 虚拟列表向上滚动时的切片锚点补偿（BGb）正常执行
+          const nativeScrollTo = Element.prototype.scrollTo;
           scrollContainer.scrollTo = function(xOrOptions, y, ...rest) {
             let targetTop = null;
+            let behavior = null;
             if (typeof xOrOptions === 'object' && xOrOptions !== null) {
               targetTop = xOrOptions.top;
+              behavior = xOrOptions.behavior;
             } else if (typeof y === 'number') {
               targetTop = y;
             }
             if (typeof targetTop === 'number') {
               const maxScroll = this.scrollHeight - this.clientHeight;
-              // 若目标位置为触底（>= maxScroll - 60），且用户正向上阅读历史 -> 拦截自动吸底
-              if (targetTop >= maxScroll - 60 && !isAutoScrollEnabled) {
-                return;
-              }
-            }
-            return origScrollTo.call(this, xOrOptions, y, ...rest);
-          };
-
-          // 2. 拦截并接管 scrollTop setter，屏蔽来自内部逻辑的强制直接触底赋值
-          const desc = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop');
-          if (desc && desc.set) {
-            Object.defineProperty(scrollContainer, 'scrollTop', {
-              get: function() { return desc.get.call(this); },
-              set: function(val) {
-                const maxScroll = this.scrollHeight - this.clientHeight;
-                if (val >= maxScroll - 60 && !isAutoScrollEnabled) {
+              const currentDist = maxScroll - this.scrollTop;
+              // 当目标位置为触底（>= maxScroll - 20），且当前视口已离开底部（currentDist > 40），且用户正向上阅读历史时：
+              // 阻断流式输出期间的高频 instant 吸底，允许用户的 smooth 导航
+              if (targetTop >= maxScroll - 20 && currentDist > 40 && isAutoScrollBlocked) {
+                if (behavior === 'instant' || !behavior) {
                   return;
                 }
-                return desc.set.call(this, val);
-              },
-              configurable: true
-            });
-          }
+              }
+            }
+            return nativeScrollTo.apply(this, arguments);
+          };
 
-          // 3. 监听滚轮事件 (向上滚瞬间锁定，绝不允许向上滚动被重置为吸底)
+          scrollContainer.addEventListener('antigravity-unblock-autoscroll', () => {
+            isAutoScrollBlocked = false;
+          });
+
+          // 2. 滚轮事件：向上滚动时瞬间打断吸底
           scrollContainer.addEventListener('wheel', (e) => {
             if (e.deltaY < 0) {
-              isAutoScrollEnabled = false;
-            } else if (e.deltaY > 0 && (scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight) <= 10) {
-              isAutoScrollEnabled = true;
+              isAutoScrollBlocked = true;
+            } else if (e.deltaY > 0) {
+              const dist = scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight;
+              if (dist <= 30) {
+                isAutoScrollBlocked = false;
+              }
             }
           }, { passive: true });
 
-          // 4. 监听触控板与触摸移动
+          // 3. 触控板与触摸事件
           let touchStartY = 0;
           scrollContainer.addEventListener('touchstart', (e) => {
             if (e.touches && e.touches[0]) touchStartY = e.touches[0].clientY;
@@ -552,30 +512,37 @@
             if (e.touches && e.touches[0]) {
               const delta = e.touches[0].clientY - touchStartY;
               if (delta > 5) {
-                isAutoScrollEnabled = false;
-              } else if (delta < -5 && (scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight) <= 10) {
-                isAutoScrollEnabled = true;
+                isAutoScrollBlocked = true;
+              } else if (delta < -5) {
+                const dist = scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight;
+                if (dist <= 30) {
+                  isAutoScrollBlocked = false;
+                }
               }
             }
           }, { passive: true });
 
-          // 5. 监听滚动事件：只要在向上滚动，坚决保持锁定；仅在明确向下滑动到底部时才恢复吸底
+          // 4. 滚动事件：当用户手动滑回最底部（<= 30px）时，恢复吸底
           scrollContainer.addEventListener('scroll', () => {
-            const curr = scrollContainer.scrollTop;
-            const dist = scrollContainer.scrollHeight - curr - scrollContainer.clientHeight;
-            if (curr < lastScrollTop - 2) {
-              isAutoScrollEnabled = false;
-            } else if (dist <= 5 && curr > lastScrollTop + 2) {
-              isAutoScrollEnabled = true;
+            const dist = scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight;
+            if (dist <= 30) {
+              isAutoScrollBlocked = false;
             }
-            lastScrollTop = curr;
           }, { passive: true });
 
-          // 6. 点击“回到底部”按钮时瞬间恢复吸底
+          // 5. 点击“回到底部”按钮或时间线最后一项时，恢复吸底
           document.addEventListener('click', (e) => {
-            const btn = e.target?.closest?.('button[aria-label*="Bottom"], button[aria-label*="底部"], [data-testid="scroll-to-bottom"]');
-            if (btn) {
-              isAutoScrollEnabled = true;
+            const bottomBtn = e.target?.closest?.('button[aria-label*="Bottom"], button[aria-label*="底部"], [data-testid="scroll-to-bottom"]');
+            if (bottomBtn) {
+              isAutoScrollBlocked = false;
+              return;
+            }
+            const timelineItem = e.target?.closest?.('.timeline-item');
+            if (timelineItem) {
+              const allItems = document.querySelectorAll('.timeline-item');
+              if (allItems.length > 0 && timelineItem === allItems[allItems.length - 1]) {
+                isAutoScrollBlocked = false;
+              }
             }
           }, true);
         })();
@@ -590,7 +557,7 @@
       const style = document.createElement('style');
       style.id = 'antigravity-scroll-stabilizer';
       style.textContent = `
-        /* 1. 彻底禁用全容器及子节点滚动锚定与吸附，杜绝向上滚动时的锚点偏移抖动 */
+        /* 1. 彻底禁用全容器及子节点滚动吸附与锚定突变，杜绝向上滚动时的锚点抖动 */
         [data-testid="autoscroll-viewport"],
         [data-testid="autoscroll-viewport"] * {
           overflow-anchor: none !important;
@@ -598,11 +565,9 @@
           scroll-snap-align: none !important;
         }
 
-        /* 2. 保证原生即时滚动响应，启用硬件加速独立合成层，杜绝文字重叠残影与闪烁 */
+        /* 2. 优化滚动层合成与边界体验 */
         [data-testid="autoscroll-viewport"] {
-          scroll-behavior: auto !important;
           overscroll-behavior-y: contain;
-          transform: translateZ(0);
           will-change: scroll-position;
         }
 
@@ -636,7 +601,6 @@
       domObserver.observe(turnsWrapper, { childList: true, subtree: false });
       turnsWrapper.__timelineObserver = domObserver;
 
-      autoPreloadHistory(scrollContainer);
       syncTurns(turnsWrapper, scrollContainer);
     }
 
