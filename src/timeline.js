@@ -565,6 +565,34 @@
       script.remove();
     }
 
+    // 9. 全局滚动平滑与防抖动守护 (Anti-Jitter & Scroll Stabilization Engine)
+    function setupScrollStabilizer() {
+      if (document.getElementById('antigravity-scroll-stabilizer')) return;
+      const style = document.createElement('style');
+      style.id = 'antigravity-scroll-stabilizer';
+      style.textContent = `
+        /* 1. 彻底禁用全容器及子节点滚动锚定，杜绝向上滚动时的锚点偏移抖动 */
+        [data-testid="autoscroll-viewport"],
+        [data-testid="autoscroll-viewport"] * {
+          overflow-anchor: none !important;
+          scroll-snap-type: none !important;
+          scroll-snap-align: none !important;
+        }
+
+        /* 2. 保证原生滚动即时响应，消除滚动插值与鼠标滚轮的阻尼冲突 */
+        [data-testid="autoscroll-viewport"] {
+          scroll-behavior: auto !important;
+          overscroll-behavior-y: contain;
+        }
+
+        /* 3. 隔离子节点样式重排重绘，保障长对话流畅渲染 */
+        .relative.flex.flex-col.gap-y-3 > div {
+          contain: style;
+        }
+      `;
+      (document.head || document.documentElement).appendChild(style);
+    }
+
     function setupTimeline() {
       const turnsWrapper = document.querySelector('.relative.flex.flex-col.gap-y-3');
       if (!turnsWrapper) return;
@@ -572,6 +600,7 @@
       if (!scrollContainer) return;
 
       setupSmartAutoScrollGuard(scrollContainer);
+      setupScrollStabilizer();
 
       if (turnsWrapper.__timelineObserver) {
         turnsWrapper.__timelineObserver.disconnect();
@@ -600,6 +629,7 @@
       const bar = document.getElementById('chat-message-timeline');
       if (turnsWrapper && scrollContainer) {
         setupSmartAutoScrollGuard(scrollContainer);
+        setupScrollStabilizer();
         autoPreloadHistory(scrollContainer);
         if (!bar || !bar.isConnected || bar.style.left !== '10px') {
           setupTimeline();
