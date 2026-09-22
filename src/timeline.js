@@ -8,7 +8,8 @@
  * - Hover card with question title and response excerpt.
  * - Smooth scroll jump with 76px top safe margin (never clipped by sticky headers).
  * - Virtualization-resistant Turn Registry: fixes missing ticks & reset numbering in long chats.
- * - Proactive background history preloader.
+ * - Viewport scroll anchoring & anti-swapping engine: guarantees turns never swap or jump.
+ * - Deterministic reading-line active tracker.
  */
 
 (function initAntigravityTimeline() {
@@ -16,8 +17,24 @@
     let currentPath = '';
     let recordedTurns = []; // [{ key, userText, aiText, el, lastScrollTop }]
     let activeIndex = -1;
-    let observer = null;
     let isPreloadingHistory = false;
+    let historyPreloadedForPath = '';
+
+    // 1. Deep user prompt normalization: thoroughly clean date/timestamp variations and edited tags
+    function cleanUserText(raw) {
+      if (!raw) return '';
+      let t = raw;
+      // Strip time patterns: HH:MM, HH:MM:SS
+      t = t.replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, '');
+      // Strip date patterns: YYYY/MM/DD, YYYY-MM-DD, MM/DD/YYYY
+      t = t.replace(/\b\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2}\b/g, '');
+      t = t.replace(/\b\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4}\b/g, '');
+      // Strip edited badges
+      t = t.replace(/\(已编辑\)|已编辑|\(edited\)|edited/gi, '');
+      // Collapse whitespace and trim
+      t = t.replace(/[,，\s]+/g, ' ').trim();
+      return t;
+    }
 
     // Extract user prompt & AI reply summary
     function extractTurnData(turn) {
@@ -25,8 +42,7 @@
       let userText = '';
       let aiText = '';
       if (userBlock) {
-        const lines = userBlock.innerText.trim().split('\n').filter(l => !/^\d{1,2}:\d{2}$/.test(l.trim()));
-        userText = lines.join(' ').trim();
+        userText = cleanUserText(userBlock.innerText);
       }
       const col = turn.firstElementChild;
       if (col && col.children.length > 1) {
@@ -39,7 +55,141 @@
       return { userText, aiText };
     }
 
-    // Smooth scroll with 76px safe margin, supporting unmounted virtualized turns
+    // 2. Viewport-anchored silent history preloader (never shifts scroll position)
+    function autoPreloadHistory(scrollContainer) {
+      if (isPreloadingHistory) return;
+      const btn = Array.from(document.querySelectorAll('button')).find(b => 
+        b.textContent.includes('Load older messages')
+      );
+      if (!btn) return;
+
+      isPreloadingHistory = true;
+      let attempts = 0;
+      const maxAttempts = 25;
+
+      function step() {
+        const b = Array.from(document.querySelectorAll('button')).find(btnEl => 
+          btnEl.textContent.includes('Load older messages')
+        );
+        if (b && attempts < maxAttempts) {
+          attempts++;
+          const prevHeight = scrollContainer ? scrollContainer.scrollHeight : 0;
+          const prevTop = scrollContainer ? scrollContainer.scrollTop : 0;
+
+          const key = Object.keys(b).find(k => k.startsWith('__reactProps'));
+          if (key && b[key] && typeof b[key].onClick === 'function') {
+            b[key].onClick({ preventDefault: () => {}, stopPropagation: () => {} });
+          } else {
+            b.click();
+          }
+
+          // Viewport scroll compensation: keep currently viewed turn fixed in viewport
+          setTimeout(() => {
+            if (scrollContainer && prevTop > 50) {
+              const delta = scrollContainer.scrollHeight - prevHeight;
+              if (delta > 0) {
+                scrollContainer.scrollTop = prevTop + delta;
+              }
+            }
+            step();
+          }, 200);
+        } else {
+          isPreloadingHistory = false;
+        }
+      }
+      step();
+    }
+
+    // 3. Strict DOM topology order sync: strictly prevents duplicates and turn swapping
+    function syncTurns(turnsWrapper, scrollContainer) {
+      if (!turnsWrapper || !scrollContainer) return;
+      const mountedEls = Array.from(turnsWrapper.querySelectorAll(':scope > .flex.items-start'));
+      if (mountedEls.length === 0) return;
+
+      const mountedTurns = [];
+      mountedEls.forEach(el => {
+        const data = extractTurnData(el);
+        if (!data.userText || data.userText.length === 0) return;
+        const cRect = scrollContainer.getBoundingClientRect();
+        const tRect = el.getBoundingClientRect();
+        const offsetTop = scrollContainer.scrollTop + (tRect.top - cRect.top);
+        mountedTurns.push({
+          key: data.userText.slice(0, 100),
+          userText: data.userText,
+          aiText: data.aiText,
+          el: el,
+          lastScrollTop: offsetTop
+        });
+      });
+
+      if (mountedTurns.length === 0) return;
+
+      // Reset when navigating to a different conversation
+      if (window.location.pathname !== currentPath) {
+        currentPath = window.location.pathname;
+        recordedTurns = [];
+        activeIndex = -1;
+        historyPreloadedForPath = '';
+      }
+
+      if (recordedTurns.length === 0) {
+        recordedTurns = [...mountedTurns];
+      } else {
+        // Locate matching turn anchor points in recordedTurns
+        let firstMatchMountedIdx = -1;
+        let firstMatchRecordedIdx = -1;
+        let lastMatchMountedIdx = -1;
+        let lastMatchRecordedIdx = -1;
+
+        for (let m = 0; m < mountedTurns.length; m++) {
+          const rIdx = recordedTurns.findIndex(r => r.key === mountedTurns[m].key);
+          if (rIdx !== -1) {
+            if (firstMatchMountedIdx === -1) {
+              firstMatchMountedIdx = m;
+              firstMatchRecordedIdx = rIdx;
+            }
+            lastMatchMountedIdx = m;
+            lastMatchRecordedIdx = rIdx;
+            // In-place refresh of DOM reference, lastScrollTop, and aiText
+            recordedTurns[rIdx].el = mountedTurns[m].el;
+            recordedTurns[rIdx].lastScrollTop = mountedTurns[m].lastScrollTop;
+            if (mountedTurns[m].aiText) recordedTurns[rIdx].aiText = mountedTurns[m].aiText;
+          }
+        }
+
+        if (firstMatchRecordedIdx !== -1) {
+          // Prepend older history (only turns strictly preceding the first match)
+          if (firstMatchMountedIdx > 0) {
+            const older = mountedTurns.slice(0, firstMatchMountedIdx).filter(
+              ot => !recordedTurns.some(r => r.key === ot.key)
+            );
+            if (older.length > 0) {
+              recordedTurns.unshift(...older);
+            }
+          }
+
+          // Append newer turns (only turns strictly following the last match)
+          if (lastMatchMountedIdx < mountedTurns.length - 1) {
+            const newer = mountedTurns.slice(lastMatchMountedIdx + 1).filter(
+              nt => !recordedTurns.some(r => r.key === nt.key)
+            );
+            if (newer.length > 0) {
+              recordedTurns.push(...newer);
+            }
+          }
+        } else {
+          // Completely new conversation without pathname change
+          recordedTurns = [...mountedTurns];
+        }
+      }
+
+      mountedEls.forEach(el => { el.style.scrollMarginTop = '76px'; });
+
+      renderTimeline(scrollContainer);
+      computeAndSetActiveTurn(scrollContainer);
+    }
+
+    // 4. Safe smooth scroll jump with 76px top safe margin
     function scrollToTurn(turnRecord, scrollContainer) {
       if (!scrollContainer) return;
       if (turnRecord.el && turnRecord.el.isConnected) {
@@ -52,7 +202,6 @@
           behavior: 'smooth'
         });
       } else {
-        // Virtualized turn unmounted from DOM: fallback to estimated / boundary scroll
         const total = recordedTurns.length;
         const idx = recordedTurns.indexOf(turnRecord);
         if (idx === 0) {
@@ -68,133 +217,93 @@
       }
     }
 
-    // Proactively preload older messages in background without jumping scroll position
-    function autoPreloadHistory() {
-      if (isPreloadingHistory) return;
-      const btn = Array.from(document.querySelectorAll('button')).find(b => 
-        b.textContent.includes('Load older messages')
-      );
-      if (!btn) return;
-      isPreloadingHistory = true;
-
-      let attempts = 0;
-      const maxAttempts = 25;
-
-      function step() {
-        const b = Array.from(document.querySelectorAll('button')).find(btnEl => 
-          btnEl.textContent.includes('Load older messages')
-        );
-        if (b && attempts < maxAttempts) {
-          attempts++;
-          const key = Object.keys(b).find(k => k.startsWith('__reactProps'));
-          if (key && b[key] && typeof b[key].onClick === 'function') {
-            b[key].onClick({ preventDefault: () => {}, stopPropagation: () => {} });
-          } else {
-            b.click();
-          }
-          setTimeout(step, 180);
-        } else {
-          isPreloadingHistory = false;
-        }
+    // 5. Direct internal scroll of timeline bar only (never bubbles to ancestor containers)
+    function scrollBarToItem(bar, it) {
+      if (!bar || !it) return;
+      const barRect = bar.getBoundingClientRect();
+      const itRect = it.getBoundingClientRect();
+      if (itRect.top < barRect.top + 6) {
+        bar.scrollTop -= (barRect.top + 6 - itRect.top);
+      } else if (itRect.bottom > barRect.bottom - 6) {
+        bar.scrollTop += (itRect.bottom - (barRect.bottom - 6));
       }
-      step();
     }
 
-    // Bidirectional merge preserving chronological turn order across DOM virtualization
-    function mergeTurns(recorded, mounted) {
-      if (recorded.length === 0) return [...mounted];
-      if (mounted.length === 0) return recorded;
+    // 6. Deterministic reading-line active turn calculation
+    function computeAndSetActiveTurn(scrollContainer) {
+      if (!scrollContainer || recordedTurns.length === 0) return;
+      const bar = document.getElementById('chat-message-timeline');
+      if (!bar) return;
 
-      let bestOverlap = null;
-      for (let r = 0; r < recorded.length; r++) {
-        for (let m = 0; m < mounted.length; m++) {
-          if (recorded[r].key === mounted[m].key) {
-            let len = 1;
-            while (
-              r + len < recorded.length &&
-              m + len < mounted.length &&
-              recorded[r + len].key === mounted[m + len].key
-            ) {
-              len++;
-            }
-            if (!bestOverlap || len > bestOverlap.length) {
-              bestOverlap = { rStart: r, mStart: m, length: len };
-            }
-          }
-        }
-      }
+      let targetIdx = -1;
+      const scrollTop = scrollContainer.scrollTop;
+      const scrollHeight = scrollContainer.scrollHeight;
+      const clientHeight = scrollContainer.clientHeight;
 
-      if (bestOverlap) {
-        const { rStart, mStart, length } = bestOverlap;
-        const prefix = [];
-        for (let m = 0; m < mStart; m++) {
-          if (!recorded.some(r => r.key === mounted[m].key)) {
-            prefix.push(mounted[m]);
-          }
-        }
-        const suffix = [];
-        for (let m = mStart + length; m < mounted.length; m++) {
-          if (!recorded.some(r => r.key === mounted[m].key)) {
-            suffix.push(mounted[m]);
-          }
-        }
-        for (let i = 0; i < length; i++) {
-          const rec = recorded[rStart + i];
-          const mnt = mounted[mStart + i];
-          rec.el = mnt.el;
-          rec.lastScrollTop = mnt.lastScrollTop;
-          if (mnt.aiText) rec.aiText = mnt.aiText;
-        }
-        return [...prefix, ...recorded, ...suffix];
+      if (scrollTop <= 20) {
+        targetIdx = 0;
+      } else if (scrollHeight - scrollTop <= clientHeight + 35) {
+        targetIdx = recordedTurns.length - 1;
       } else {
-        const firstMountedTop = mounted[0].lastScrollTop || 0;
-        const lastRecordedTop = recorded[recorded.length - 1]?.lastScrollTop || 0;
-        if (firstMountedTop >= lastRecordedTop) {
-          return [...recorded, ...mounted];
-        } else {
-          return [...mounted, ...recorded];
-        }
-      }
-    }
-
-    // Synchronize currently mounted DOM nodes with persistent session registry
-    function syncTurns(turnsWrapper, scrollContainer) {
-      if (!turnsWrapper || !scrollContainer) return;
-      const mountedEls = Array.from(turnsWrapper.querySelectorAll(':scope > .flex.items-start'));
-      if (mountedEls.length === 0) return;
-
-      const mountedTurns = [];
-      mountedEls.forEach(el => {
-        const data = extractTurnData(el);
-        if (!data.userText || data.userText.length === 0) return;
         const cRect = scrollContainer.getBoundingClientRect();
-        const tRect = el.getBoundingClientRect();
-        const offsetTop = scrollContainer.scrollTop + (tRect.top - cRect.top);
-        mountedTurns.push({
-          key: data.userText.slice(0, 120),
-          userText: data.userText,
-          aiText: data.aiText,
-          el: el,
-          lastScrollTop: offsetTop
-        });
-      });
+        const readingLine = cRect.top + 110;
 
-      if (mountedTurns.length === 0) return;
-
-      if (window.location.pathname !== currentPath) {
-        currentPath = window.location.pathname;
-        recordedTurns = [];
-        activeIndex = -1;
+        for (let i = 0; i < recordedTurns.length; i++) {
+          const turn = recordedTurns[i];
+          if (turn.el && turn.el.isConnected) {
+            const tRect = turn.el.getBoundingClientRect();
+            if (tRect.top <= readingLine && tRect.bottom > readingLine) {
+              targetIdx = i;
+              break;
+            }
+            if (tRect.top > readingLine && targetIdx === -1) {
+              targetIdx = Math.max(0, i - 1);
+              break;
+            }
+          }
+        }
+        if (targetIdx === -1) targetIdx = recordedTurns.length - 1;
       }
 
-      recordedTurns = mergeTurns(recordedTurns, mountedTurns);
+      if (targetIdx !== -1 && targetIdx !== activeIndex) {
+        activeIndex = targetIdx;
+        const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches ||
+                       document.documentElement.classList.contains('dark') ||
+                       window.getComputedStyle(document.body).backgroundColor.includes('rgb(19') ||
+                       window.getComputedStyle(document.body).backgroundColor.includes('rgb(25');
+        const primaryColor = isDark ? '#f4f4f5' : '#18181b';
+        const mutedColor = isDark ? 'rgba(255, 255, 255, 0.35)' : 'rgba(0, 0, 0, 0.28)';
+        const numColor = isDark ? 'rgba(255, 255, 255, 0.45)' : 'rgba(0, 0, 0, 0.4)';
+        const numActiveColor = isDark ? '#ffffff' : '#09090b';
 
-      mountedEls.forEach(el => { el.style.scrollMarginTop = '76px'; });
-
-      renderTimeline(scrollContainer);
+        const items = bar.querySelectorAll('.timeline-item');
+        items.forEach((it, i) => {
+          const ln = it.querySelector('.timeline-line');
+          const nm = it.querySelector('.timeline-num');
+          if (!ln) return;
+          if (i === activeIndex) {
+            ln.style.width = '24px';
+            ln.style.height = '2.5px';
+            ln.style.background = primaryColor;
+            if (nm) {
+              nm.style.color = numActiveColor;
+              nm.style.fontWeight = '700';
+            }
+            scrollBarToItem(bar, it);
+          } else {
+            ln.style.width = '12px';
+            ln.style.height = '2px';
+            ln.style.background = mutedColor;
+            if (nm) {
+              nm.style.color = numColor;
+              nm.style.fontWeight = '500';
+            }
+          }
+        });
+      }
     }
 
-    // Render timeline UI
+    // 7. Render timeline DOM
     function renderTimeline(scrollContainer) {
       const turnsWrapper = document.querySelector('.relative.flex.flex-col.gap-y-3');
       if (!turnsWrapper || !scrollContainer || !scrollContainer.parentElement) return;
@@ -355,65 +464,17 @@
         });
       }
 
-      function updateActiveHighlight(newIndex) {
-        if (newIndex === activeIndex || newIndex < 0 || newIndex >= recordedTurns.length) return;
-        activeIndex = newIndex;
-        const items = bar.querySelectorAll('.timeline-item');
-        items.forEach((it, i) => {
-          const ln = it.querySelector('.timeline-line');
-          const nm = it.querySelector('.timeline-num');
-          if (!ln) return;
-          if (i === activeIndex) {
-            ln.style.width = '24px';
-            ln.style.height = '2.5px';
-            ln.style.background = primaryColor;
-            if (nm) {
-              nm.style.color = numActiveColor;
-              nm.style.fontWeight = '700';
-            }
-            it.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-          } else {
-            ln.style.width = '12px';
-            ln.style.height = '2px';
-            ln.style.background = mutedColor;
-            if (nm) {
-              nm.style.color = numColor;
-              nm.style.fontWeight = '500';
-            }
-          }
-        });
-      }
-
-      if (observer) observer.disconnect();
-      observer = new IntersectionObserver((entries) => {
-        entries.forEach(entry => {
-          if (entry.isIntersecting) {
-            const matchedIdx = recordedTurns.findIndex(r => r.el === entry.target);
-            if (matchedIdx !== -1) {
-              updateActiveHighlight(matchedIdx);
-            }
-          }
-        });
-      }, {
-        root: scrollContainer,
-        rootMargin: '-35% 0px -35% 0px',
-        threshold: 0
-      });
-
-      recordedTurns.forEach(r => {
-        if (r.el && r.el.isConnected) {
-          observer.observe(r.el);
-        }
-      });
-
-      // Top and bottom scroll boundary fallback for 100% accurate highlights
+      // Native throttled scroll listener for accurate active highlight without side effects
       if (!scrollContainer.__timelineScrollBound) {
         scrollContainer.__timelineScrollBound = true;
+        let ticking = false;
         scrollContainer.addEventListener('scroll', () => {
-          if (scrollContainer.scrollTop <= 10) {
-            updateActiveHighlight(0);
-          } else if (scrollContainer.scrollHeight - scrollContainer.scrollTop <= scrollContainer.clientHeight + 25) {
-            updateActiveHighlight(recordedTurns.length - 1);
+          if (!ticking) {
+            ticking = true;
+            requestAnimationFrame(() => {
+              ticking = false;
+              computeAndSetActiveTurn(scrollContainer);
+            });
           }
         }, { passive: true });
       }
@@ -428,28 +489,37 @@
       if (turnsWrapper.__timelineObserver) {
         turnsWrapper.__timelineObserver.disconnect();
       }
+      let syncDebounce = null;
       const domObserver = new MutationObserver(() => {
-        autoPreloadHistory();
-        syncTurns(turnsWrapper, scrollContainer);
+        if (syncDebounce) clearTimeout(syncDebounce);
+        syncDebounce = setTimeout(() => {
+          syncTurns(turnsWrapper, scrollContainer);
+        }, 150);
       });
       domObserver.observe(turnsWrapper, { childList: true, subtree: false });
       turnsWrapper.__timelineObserver = domObserver;
 
-      autoPreloadHistory();
+      autoPreloadHistory(scrollContainer);
       syncTurns(turnsWrapper, scrollContainer);
     }
 
-    // SPA navigation watcher & periodic check
+    // SPA navigation watcher & periodic light check
+    if (window.__antigravityTimelineTimer) {
+      clearInterval(window.__antigravityTimelineTimer);
+    }
     window.__antigravityTimelineTimer = setInterval(() => {
       const turnsWrapper = document.querySelector('.relative.flex.flex-col.gap-y-3');
       const scrollContainer = turnsWrapper?.closest('.overflow-y-auto');
       const bar = document.getElementById('chat-message-timeline');
       if (turnsWrapper && scrollContainer) {
-        autoPreloadHistory();
+        autoPreloadHistory(scrollContainer);
         if (!bar || !bar.isConnected || bar.style.left !== '10px') {
           setupTimeline();
         } else {
-          syncTurns(turnsWrapper, scrollContainer);
+          const mountedCount = turnsWrapper.querySelectorAll(':scope > .flex.items-start').length;
+          if (mountedCount !== recordedTurns.length) {
+            syncTurns(turnsWrapper, scrollContainer);
+          }
         }
       }
     }, 1000);
